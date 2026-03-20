@@ -1,13 +1,17 @@
 import { describe, test, expect } from "bun:test";
-import { encodeLabel, decodeLabel, pathToLtree, ltreeToPath } from "../src/path-encoding";
+import { encodeLabel, decodeLabel, pathToLtree, ltreeToPath, normalizePath } from "../src/path-encoding";
 
 describe("encodeLabel", () => {
   test("passes through alphanumeric", () => {
     expect(encodeLabel("hello")).toBe("hello");
   });
 
-  test("passes through hyphens and underscores", () => {
-    expect(encodeLabel("my-file_name")).toBe("my-file_name");
+  test("passes through hyphens", () => {
+    expect(encodeLabel("my-file")).toBe("my-file");
+  });
+
+  test("encodes underscores", () => {
+    expect(encodeLabel("my_file")).toBe("my__5F__file");
   });
 
   test("encodes dots", () => {
@@ -29,6 +33,22 @@ describe("encodeLabel", () => {
   test("encodes hash", () => {
     expect(encodeLabel("file#1")).toBe("file__23__1");
   });
+
+  test("throws on empty string", () => {
+    expect(() => encodeLabel("")).toThrow("Cannot encode empty filename");
+  });
+
+  test("throws on null byte", () => {
+    expect(() => encodeLabel("file\0name")).toThrow("null bytes");
+  });
+
+  test("no collision between literal __dot__ and encoded dot", () => {
+    const dotEncoded = encodeLabel(".");
+    const literalEncoded = encodeLabel("__dot__");
+    expect(dotEncoded).not.toBe(literalEncoded);
+    expect(decodeLabel(dotEncoded)).toBe(".");
+    expect(decodeLabel(literalEncoded)).toBe("__dot__");
+  });
 });
 
 describe("decodeLabel", () => {
@@ -48,8 +68,12 @@ describe("decodeLabel", () => {
     expect(decodeLabel("file__40__name")).toBe("file@name");
   });
 
+  test("decodes underscores", () => {
+    expect(decodeLabel("my__5F__file")).toBe("my_file");
+  });
+
   test("roundtrips complex names", () => {
-    const names = ["hello.world.txt", "my file (1).md", "résumé.pdf", "a+b=c.js"];
+    const names = ["hello.world.txt", "my file (1).md", "résumé.pdf", "a+b=c.js", "under_score"];
     for (const name of names) {
       expect(decodeLabel(encodeLabel(name))).toBe(name);
     }
@@ -63,39 +87,65 @@ describe("decodeLabel", () => {
   });
 });
 
-describe("pathToLtree", () => {
-  test("converts root path", () => {
-    expect(pathToLtree("/", 42)).toBe("u42");
+describe("normalizePath", () => {
+  test("resolves .. segments", () => {
+    expect(normalizePath("/home/user/../other")).toBe("/home/other");
   });
 
-  test("converts simple path", () => {
-    expect(pathToLtree("/home", 42)).toBe("u42.home");
-  });
-
-  test("converts nested path", () => {
-    expect(pathToLtree("/home/docs/readme.md", 42)).toBe("u42.home.docs.readme__dot__md");
-  });
-
-  test("handles trailing slash", () => {
-    expect(pathToLtree("/home/docs/", 42)).toBe("u42.home.docs");
+  test("resolves . segments", () => {
+    expect(normalizePath("/home/./file")).toBe("/home/file");
   });
 
   test("normalizes double slashes", () => {
-    expect(pathToLtree("/home//docs", 42)).toBe("u42.home.docs");
+    expect(normalizePath("/home//docs")).toBe("/home/docs");
+  });
+
+  test("resolves root", () => {
+    expect(normalizePath("/")).toBe("/");
+  });
+
+  test("throws on null byte", () => {
+    expect(() => normalizePath("/foo\0bar")).toThrow("null bytes");
+  });
+});
+
+describe("pathToLtree", () => {
+  test("converts root path", () => {
+    expect(pathToLtree("/", 42)).toBe("s42");
+  });
+
+  test("converts simple path", () => {
+    expect(pathToLtree("/home", 42)).toBe("s42.home");
+  });
+
+  test("converts nested path", () => {
+    expect(pathToLtree("/home/docs/readme.md", 42)).toBe("s42.home.docs.readme__dot__md");
+  });
+
+  test("handles trailing slash", () => {
+    expect(pathToLtree("/home/docs/", 42)).toBe("s42.home.docs");
+  });
+
+  test("normalizes double slashes", () => {
+    expect(pathToLtree("/home//docs", 42)).toBe("s42.home.docs");
+  });
+
+  test("normalizes .. components", () => {
+    expect(pathToLtree("/home/../etc", 42)).toBe("s42.etc");
   });
 });
 
 describe("ltreeToPath", () => {
   test("converts root", () => {
-    expect(ltreeToPath("u42")).toBe("/");
+    expect(ltreeToPath("s42")).toBe("/");
   });
 
   test("converts simple path", () => {
-    expect(ltreeToPath("u42.home")).toBe("/home");
+    expect(ltreeToPath("s42.home")).toBe("/home");
   });
 
   test("converts nested path with encoded chars", () => {
-    expect(ltreeToPath("u42.home.docs.readme__dot__md")).toBe("/home/docs/readme.md");
+    expect(ltreeToPath("s42.home.docs.readme__dot__md")).toBe("/home/docs/readme.md");
   });
 
   test("roundtrips paths", () => {

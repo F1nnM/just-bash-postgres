@@ -8,17 +8,50 @@ export interface SearchResult {
   snippet?: string;
 }
 
+const MAX_SEARCH_LIMIT = 1000;
+
+function clampLimit(limit: number | undefined): number {
+  const val = limit ?? 20;
+  return Math.min(Math.max(1, val), MAX_SEARCH_LIMIT);
+}
+
+export function validateEmbedding(embedding: number[], expectedDimensions?: number): void {
+  if (expectedDimensions !== undefined && embedding.length !== expectedDimensions) {
+    throw new Error(
+      `Embedding dimension mismatch: expected ${expectedDimensions}, got ${embedding.length}`
+    );
+  }
+  for (let i = 0; i < embedding.length; i++) {
+    if (!Number.isFinite(embedding[i])) {
+      throw new Error(`Embedding contains non-finite value at index ${i}: ${embedding[i]}`);
+    }
+  }
+}
+
+interface FtsRow {
+  path: string;
+  name: string;
+  rank: string;
+  snippet: string;
+}
+
+interface VectorRow {
+  path: string;
+  name: string;
+  rank: string;
+}
+
 export async function fullTextSearch(
   sql: postgres.Sql,
-  userId: number,
+  sessionId: number,
   ltreePrefix: string,
   query: string,
   opts?: { path?: string; limit?: number }
 ): Promise<SearchResult[]> {
-  const limit = opts?.limit ?? 20;
+  const limit = clampLimit(opts?.limit);
   const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
 
-  const rows = await sql`
+  const rows = await sql<FtsRow[]>`
     SELECT
       path::text as path,
       name,
@@ -26,7 +59,7 @@ export async function fullTextSearch(
       ts_headline('english', coalesce(content, ''), websearch_to_tsquery('english', ${query}),
         'MaxWords=35, MinWords=15, MaxFragments=1') AS snippet
     FROM fs_nodes
-    WHERE owner_id = ${userId}
+    WHERE session_id = ${sessionId}
       AND path <@ ${scopeLtree}::ltree
       AND node_type = 'file'
       AND search_vector @@ websearch_to_tsquery('english', ${query})
@@ -34,7 +67,7 @@ export async function fullTextSearch(
     LIMIT ${limit}
   `;
 
-  return rows.map((r: any) => ({
+  return rows.map((r) => ({
     path: ltreeToPath(r.path),
     name: r.name,
     rank: parseFloat(r.rank),
@@ -44,22 +77,23 @@ export async function fullTextSearch(
 
 export async function semanticSearch(
   sql: postgres.Sql,
-  userId: number,
+  sessionId: number,
   ltreePrefix: string,
   embedding: number[],
   opts?: { path?: string; limit?: number }
 ): Promise<SearchResult[]> {
-  const limit = opts?.limit ?? 20;
+  const limit = clampLimit(opts?.limit);
   const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
+  validateEmbedding(embedding);
   const embeddingStr = `[${embedding.join(",")}]`;
 
-  const rows = await sql`
+  const rows = await sql<VectorRow[]>`
     SELECT
       path::text as path,
       name,
       1 - (embedding <=> ${embeddingStr}::vector) AS rank
     FROM fs_nodes
-    WHERE owner_id = ${userId}
+    WHERE session_id = ${sessionId}
       AND path <@ ${scopeLtree}::ltree
       AND node_type = 'file'
       AND embedding IS NOT NULL
@@ -67,7 +101,7 @@ export async function semanticSearch(
     LIMIT ${limit}
   `;
 
-  return rows.map((r: any) => ({
+  return rows.map((r) => ({
     path: ltreeToPath(r.path),
     name: r.name,
     rank: parseFloat(r.rank),
@@ -76,26 +110,27 @@ export async function semanticSearch(
 
 export async function hybridSearch(
   sql: postgres.Sql,
-  userId: number,
+  sessionId: number,
   ltreePrefix: string,
   query: string,
   embedding: number[],
   opts?: { path?: string; textWeight?: number; vectorWeight?: number; limit?: number }
 ): Promise<SearchResult[]> {
-  const limit = opts?.limit ?? 20;
+  const limit = clampLimit(opts?.limit);
   const textWeight = opts?.textWeight ?? 0.4;
   const vectorWeight = opts?.vectorWeight ?? 0.6;
   const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
+  validateEmbedding(embedding);
   const embeddingStr = `[${embedding.join(",")}]`;
 
-  const rows = await sql`
+  const rows = await sql<VectorRow[]>`
     SELECT
       path::text as path,
       name,
       (${textWeight} * ts_rank(search_vector, websearch_to_tsquery('english', ${query})) +
        ${vectorWeight} * (1 - (embedding <=> ${embeddingStr}::vector))) AS rank
     FROM fs_nodes
-    WHERE owner_id = ${userId}
+    WHERE session_id = ${sessionId}
       AND path <@ ${scopeLtree}::ltree
       AND node_type = 'file'
       AND search_vector @@ websearch_to_tsquery('english', ${query})
@@ -104,7 +139,7 @@ export async function hybridSearch(
     LIMIT ${limit}
   `;
 
-  return rows.map((r: any) => ({
+  return rows.map((r) => ({
     path: ltreeToPath(r.path),
     name: r.name,
     rank: parseFloat(r.rank),

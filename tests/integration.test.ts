@@ -20,7 +20,7 @@ describe("just-bash integration", () => {
 
   beforeEach(async () => {
     await resetDb(sql);
-    pgFs = new PgFileSystem({ sql, userId: 1 });
+    pgFs = new PgFileSystem({ sql, sessionId: 1 });
     await pgFs.setup();
     bash = new Bash({ fs: pgFs, cwd: "/", defenseInDepth: false });
   });

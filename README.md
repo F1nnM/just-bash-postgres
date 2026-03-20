@@ -1,6 +1,6 @@
 # just-bash-postgres
 
-A PostgreSQL-backed filesystem provider for [just-bash](https://github.com/nicholasgasior/just-bash). It implements the `IFileSystem` interface using a single `fs_nodes` table with ltree for hierarchy, built-in full-text search, optional pgvector semantic search, and row-level security for per-user isolation.
+A PostgreSQL-backed filesystem provider for [just-bash](https://github.com/nicholasgasior/just-bash). It implements the `IFileSystem` interface using a single `fs_nodes` table with ltree for hierarchy, built-in full-text search, optional pgvector semantic search, and row-level security for per-session isolation.
 
 ## Installation
 
@@ -22,7 +22,7 @@ import { Bash } from "just-bash";
 
 const sql = postgres("postgres://user:pass@localhost:5432/mydb");
 
-const fs = new PgFileSystem({ sql, userId: 1 });
+const fs = new PgFileSystem({ sql, sessionId: 1 });
 await fs.setup(); // creates tables, indexes, and RLS policies
 
 const bash = new Bash({ fs, cwd: "/", defenseInDepth: false });
@@ -36,7 +36,7 @@ console.log(result.stdout); // "hello\n"
 
 ## Schema Setup
 
-Calling `fs.setup()` runs an idempotent migration that creates the `fs_nodes` table, indexes, and RLS policies. It also creates the root directory for the user. You can call it on every startup safely -- it uses `IF NOT EXISTS` guards throughout.
+Calling `fs.setup()` runs an idempotent migration that creates the `fs_nodes` table, indexes, and RLS policies. It also creates the root directory for the session. You can call it on every startup safely -- it uses `IF NOT EXISTS` guards throughout.
 
 If you pass `embeddingDimensions` in the options, `setup()` also creates the pgvector extension and adds an `embedding` column with an HNSW index.
 
@@ -60,7 +60,7 @@ Requires an embedding provider. Uses pgvector cosine similarity over HNSW indexe
 ```typescript
 const fs = new PgFileSystem({
   sql,
-  userId: 1,
+  sessionId: 1,
   embed: async (text) => openai.embeddings.create({ input: text, model: "text-embedding-3-small" }).then(r => r.data[0].embedding),
   embeddingDimensions: 1536,
 });
@@ -98,22 +98,22 @@ interface SearchResult {
 }
 ```
 
-## User Isolation
+## Session Isolation
 
-Each `PgFileSystem` instance is bound to a `userId`. All queries include `WHERE owner_id = $userId`, and the database schema enforces the same constraint via RLS policies. Users cannot see or modify each other's files.
+Each `PgFileSystem` instance is bound to a `sessionId`. All queries include `WHERE owner_id = $sessionId`, and the database schema enforces the same constraint via RLS policies. Sessions cannot see or modify each other's files.
 
 ```typescript
-const userAFs = new PgFileSystem({ sql, userId: 1 });
-const userBFs = new PgFileSystem({ sql, userId: 2 });
+const sessionAFs = new PgFileSystem({ sql, sessionId: 1 });
+const sessionBFs = new PgFileSystem({ sql, sessionId: 2 });
 
-await userAFs.setup();
-await userBFs.setup();
+await sessionAFs.setup();
+await sessionBFs.setup();
 
-await userAFs.writeFile("/secret.txt", "user A data");
-await userBFs.exists("/secret.txt"); // false -- completely isolated
+await sessionAFs.writeFile("/secret.txt", "session A data");
+await sessionBFs.exists("/secret.txt"); // false -- completely isolated
 ```
 
-No users table is required. `userId` is just a number; user management is the consuming application's responsibility.
+No sessions table is required. `sessionId` is just a number; session management is the consuming application's responsibility.
 
 ## Configuration
 
@@ -122,8 +122,8 @@ interface PgFileSystemOptions {
   /** postgres.js connection instance */
   sql: postgres.Sql;
 
-  /** Numeric user ID for isolation. All operations are scoped to this user. */
-  userId: number;
+  /** Numeric session ID for isolation. All operations are scoped to this session. */
+  sessionId: number;
 
   /** Optional async function that returns an embedding vector for a text string.
       When provided, writeFile generates embeddings for text content. */
@@ -134,6 +134,32 @@ interface PgFileSystemOptions {
   embeddingDimensions?: number;
 }
 ```
+
+## Security Considerations
+
+### Trust Model
+
+The `sessionId` is trusted without verification. The library does not authenticate sessions -- it assumes the consuming application has already validated the session before constructing a `PgFileSystem` instance.
+
+### Connection Security
+
+Use TLS for database connections in production by setting `sslmode=require` (or stricter) in your connection string:
+
+```typescript
+const sql = postgres("postgres://user:pass@host:5432/db?sslmode=require");
+```
+
+### Row-Level Security
+
+The library sets `app.session_id` as a PostgreSQL session variable per transaction, which RLS policies reference to enforce isolation. For full RLS protection, use a non-superuser database role -- superusers bypass RLS entirely.
+
+### Defense in Depth
+
+Setting `defenseInDepth: false` on the just-bash `Bash` instance disables just-bash's built-in sandbox. This is necessary because postgres.js requires raw network access. Compensate with network-level controls (firewall rules, VPC configuration) to restrict what the host can reach.
+
+### File Size Limits
+
+File size is configurable via the `maxFileSize` option (default 100MB). Set an appropriate limit for your use case to prevent excessive storage consumption.
 
 ## Development
 

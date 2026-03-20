@@ -3,7 +3,6 @@ import { createTestSql, resetDb } from "./helpers";
 import { PgFileSystem } from "../src/pg-filesystem";
 import type postgres from "postgres";
 
-// Simple deterministic mock embedder: hashes text into a 3-dimensional vector
 function mockEmbed(text: string): Promise<number[]> {
   let h1 = 0, h2 = 0, h3 = 0;
   for (let i = 0; i < text.length; i++) {
@@ -32,7 +31,7 @@ describe("Vector Search", () => {
     await resetDb(sql);
     fs = new PgFileSystem({
       sql,
-      userId: 1,
+      sessionId: 1,
       embed: mockEmbed,
       embeddingDimensions: 3,
     });
@@ -46,7 +45,6 @@ describe("Vector Search", () => {
   test("semantic search returns results ordered by similarity", async () => {
     const results = await fs.semanticSearch("neural networks deep learning");
     expect(results.length).toBeGreaterThan(0);
-    // All results should have a rank (similarity score)
     for (const r of results) {
       expect(typeof r.rank).toBe("number");
     }
@@ -70,14 +68,12 @@ describe("Vector Search", () => {
   });
 
   test("throws when no embed provider configured", async () => {
-    const fsNoEmbed = new PgFileSystem({ sql, userId: 1 });
-    // Don't call setup since schema already exists
+    const fsNoEmbed = new PgFileSystem({ sql, sessionId: 1 });
     expect(fsNoEmbed.semanticSearch("test")).rejects.toThrow("No embedding provider");
   });
 
   test("binary files don't get embeddings", async () => {
     await fs.writeFile("/bin.dat", new Uint8Array([1, 2, 3]));
-    // Should not throw — binary write skips embedding
     const results = await fs.semanticSearch("binary data");
     const paths = results.map(r => r.path);
     expect(paths).not.toContain("/bin.dat");

@@ -28,7 +28,7 @@ describe("setupSchema", () => {
     `;
     const columns = result.map((r: { column_name: string }) => r.column_name);
     expect(columns).toContain("id");
-    expect(columns).toContain("owner_id");
+    expect(columns).toContain("session_id");
     expect(columns).toContain("parent_id");
     expect(columns).toContain("name");
     expect(columns).toContain("node_type");
@@ -54,6 +54,6 @@ describe("setupSchema", () => {
 
   test("is idempotent", async () => {
     await setupSchema(sql);
-    await setupSchema(sql); // should not throw
+    await setupSchema(sql);
   });
 });

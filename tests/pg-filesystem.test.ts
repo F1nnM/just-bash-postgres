@@ -18,8 +18,26 @@ describe("PgFileSystem", () => {
 
   beforeEach(async () => {
     await resetDb(sql);
-    fs = new PgFileSystem({ sql, userId: 1 });
+    fs = new PgFileSystem({ sql, sessionId: 1 });
     await fs.setup();
+  });
+
+  describe("constructor validation", () => {
+    test("rejects non-integer sessionId", () => {
+      expect(() => new PgFileSystem({ sql, sessionId: 1.5 })).toThrow("Invalid sessionId");
+    });
+
+    test("rejects zero sessionId", () => {
+      expect(() => new PgFileSystem({ sql, sessionId: 0 })).toThrow("Invalid sessionId");
+    });
+
+    test("rejects negative sessionId", () => {
+      expect(() => new PgFileSystem({ sql, sessionId: -1 })).toThrow("Invalid sessionId");
+    });
+
+    test("rejects NaN sessionId", () => {
+      expect(() => new PgFileSystem({ sql, sessionId: NaN })).toThrow("Invalid sessionId");
+    });
   });
 
   describe("writeFile + readFile", () => {
@@ -136,7 +154,7 @@ describe("PgFileSystem", () => {
 
     test("recursive is idempotent", async () => {
       await fs.mkdir("/mydir", { recursive: true });
-      await fs.mkdir("/mydir", { recursive: true }); // no throw
+      await fs.mkdir("/mydir", { recursive: true });
     });
   });
 
@@ -204,7 +222,7 @@ describe("PgFileSystem", () => {
     });
 
     test("force ignores non-existent", async () => {
-      await fs.rm("/nope", { force: true }); // no throw
+      await fs.rm("/nope", { force: true });
     });
   });
 
@@ -220,6 +238,12 @@ describe("PgFileSystem", () => {
       await fs.writeFile("/srcdir/a.txt", "a");
       await fs.cp("/srcdir", "/dstdir", { recursive: true });
       expect(await fs.readFile("/dstdir/a.txt")).toBe("a");
+    });
+
+    test("rejects copy to subdirectory of itself", async () => {
+      await fs.mkdir("/srcdir");
+      await fs.writeFile("/srcdir/a.txt", "a");
+      expect(fs.cp("/srcdir", "/srcdir/sub", { recursive: true })).rejects.toThrow("EINVAL");
     });
   });
 
@@ -244,6 +268,11 @@ describe("PgFileSystem", () => {
       await fs.mkdir("/dest");
       await fs.mv("/srcdir", "/dest/moved");
       expect(await fs.readFile("/dest/moved/sub/file.txt")).toBe("data");
+    });
+
+    test("rejects move to subdirectory of itself", async () => {
+      await fs.mkdir("/srcdir/sub", { recursive: true });
+      expect(fs.mv("/srcdir", "/srcdir/sub/moved")).rejects.toThrow("EINVAL");
     });
   });
 

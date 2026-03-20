@@ -18,10 +18,9 @@ describe("Full-text search", () => {
 
   beforeEach(async () => {
     await resetDb(sql);
-    fs = new PgFileSystem({ sql, userId: 1 });
+    fs = new PgFileSystem({ sql, sessionId: 1 });
     await fs.setup();
 
-    // Seed test files
     await fs.mkdir("/docs", { recursive: true });
     await fs.mkdir("/projects", { recursive: true });
     await fs.writeFile("/docs/meeting-notes.md", "Discussed quarterly revenue targets and marketing budget allocation for next year");
@@ -41,7 +40,6 @@ describe("Full-text search", () => {
   test("ranks filename matches higher", async () => {
     await fs.writeFile("/revenue_report", "some generic content");
     const results = await fs.search("revenue");
-    // File with "revenue" in name should rank higher due to weight A on name
     expect(results[0].path).toBe("/revenue_report");
   });
 
