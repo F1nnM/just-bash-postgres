@@ -10,6 +10,8 @@ import type {
 } from "just-bash";
 import { pathToLtree, ltreeToPath, encodeLabel, decodeLabel } from "./path-encoding";
 import { setupSchema, setupVectorColumn } from "./schema";
+import { fullTextSearch, semanticSearch as doSemanticSearch, hybridSearch as doHybridSearch } from "./search";
+import type { SearchResult } from "./search";
 
 // These types are used by IFileSystem but not exported from just-bash's public API
 interface ReadFileOptions {
@@ -483,6 +485,32 @@ export class PgFileSystem implements IFileSystem {
   getAllPaths(): string[] {
     // Synchronous -- cannot query DB. Return empty as AgentFS does.
     return [];
+  }
+
+  // -- Search ----------------------------------------------------------------
+
+  async search(query: string, opts?: { path?: string; limit?: number }): Promise<SearchResult[]> {
+    const ltreePrefix = pathToLtree("/", this.userId);
+    return fullTextSearch(this.sql, this.userId, ltreePrefix, query, opts);
+  }
+
+  async semanticSearch(query: string, opts?: { path?: string; limit?: number }): Promise<SearchResult[]> {
+    if (!this.embed) throw new Error("No embedding provider configured");
+    const embedding = await this.embed(query);
+    const ltreePrefix = pathToLtree("/", this.userId);
+    return doSemanticSearch(this.sql, this.userId, ltreePrefix, embedding, opts);
+  }
+
+  async hybridSearch(query: string, opts?: {
+    path?: string;
+    textWeight?: number;
+    vectorWeight?: number;
+    limit?: number;
+  }): Promise<SearchResult[]> {
+    if (!this.embed) throw new Error("No embedding provider configured");
+    const embedding = await this.embed(query);
+    const ltreePrefix = pathToLtree("/", this.userId);
+    return doHybridSearch(this.sql, this.userId, ltreePrefix, query, embedding, opts);
   }
 }
 
