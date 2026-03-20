@@ -9,6 +9,9 @@ export async function setupSchema(sql: postgres.Sql): Promise<void> {
 }
 
 export async function setupVectorColumn(sql: postgres.Sql, dimensions: number): Promise<void> {
+  if (!Number.isInteger(dimensions) || dimensions < 1) {
+    throw new Error(`Invalid vector dimensions: ${dimensions}`);
+  }
   await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS vector`);
 
   const hasColumn = await sql`

@@ -30,6 +30,7 @@ CREATE INDEX IF NOT EXISTS idx_fs_search ON fs_nodes USING GIN (search_vector);
 
 -- RLS: per-user isolation
 ALTER TABLE fs_nodes ENABLE ROW LEVEL SECURITY;
+ALTER TABLE fs_nodes FORCE ROW LEVEL SECURITY;
 
 DO $$ BEGIN
     IF NOT EXISTS (
