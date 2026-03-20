@@ -83,6 +83,20 @@ export class PgFileSystem implements IFileSystem {
     return pathToLtree(posixPath, this.userId);
   }
 
+  private async query<T extends object>(fn: (sql: postgres.Sql) => Promise<T[]>): Promise<T[]> {
+    return this.sql.begin(async (tx) => {
+      await tx`SELECT set_config('app.user_id', ${String(this.userId)}, true)`;
+      return fn(tx);
+    });
+  }
+
+  private async execute(fn: (sql: postgres.Sql) => Promise<void>): Promise<void> {
+    await this.sql.begin(async (tx) => {
+      await tx`SELECT set_config('app.user_id', ${String(this.userId)}, true)`;
+      await fn(tx);
+    });
+  }
+
   private async getNode(posixPath: string): Promise<FsRow | null> {
     const lt = this.ltree(posixPath);
     const rows = await this.sql<FsRow[]>`
@@ -140,6 +154,9 @@ export class PgFileSystem implements IFileSystem {
     const parent = await this.getNode(parentPosix);
     if (!parent) throw new Error(`ENOENT: no such file or directory, open '${path}'`);
 
+    const existing = await this.getNode(path);
+    if (existing?.node_type === "directory") throw new Error(`EISDIR: illegal operation on a directory, open '${path}'`);
+
     const lt = this.ltree(path);
     const isText = typeof content === "string";
     const textContent = isText ? content : null;
@@ -187,14 +204,9 @@ export class PgFileSystem implements IFileSystem {
     const currentContent = existing.content ??
       (existing.binary_data ? new TextDecoder().decode(existing.binary_data) : "");
     const newContent = currentContent + textContent;
-    const sizeBytes = Buffer.byteLength(newContent);
 
-    const lt = this.ltree(path);
-    await this.sql`
-      UPDATE fs_nodes
-      SET content = ${newContent}, size_bytes = ${sizeBytes}, mtime = now()
-      WHERE owner_id = ${this.userId} AND path = ${lt}::ltree
-    `;
+    // Use writeFile to handle embedding regeneration and consistent upsert
+    await this.writeFile(path, newContent, options);
   }
 
   // -- Path queries ------------------------------------------------------------
@@ -399,26 +411,36 @@ export class PgFileSystem implements IFileSystem {
     const newLtree = this.ltree(dest);
     const oldLtree = this.ltree(src);
 
-    if (srcNode.node_type === "directory") {
-      // Update all descendants' paths
-      const oldPrefix = oldLtree;
-      const newPrefix = newLtree;
-      // Update descendants first (those whose path starts with old path)
-      await this.sql`
-        UPDATE fs_nodes
-        SET path = (${newPrefix}::ltree || subpath(path, nlevel(${oldPrefix}::ltree)))
-        WHERE owner_id = ${this.userId}
-          AND path <@ ${oldPrefix}::ltree
-          AND path != ${oldPrefix}::ltree
-      `;
-    }
-
-    // Update the node itself
+    // Update the node itself first
     await this.sql`
       UPDATE fs_nodes
       SET name = ${newName}, path = ${newLtree}::ltree, parent_id = ${destParent.id}, mtime = now()
       WHERE owner_id = ${this.userId} AND id = ${srcNode.id}
     `;
+
+    if (srcNode.node_type === "directory") {
+      // Update all descendants' paths
+      const oldPrefix = oldLtree;
+      const newPrefix = newLtree;
+      await this.sql`
+        UPDATE fs_nodes
+        SET path = (${newPrefix}::ltree || subpath(path, nlevel(${oldPrefix}::ltree)))
+        WHERE owner_id = ${this.userId}
+          AND path <@ ${oldPrefix}::ltree
+      `;
+
+      // Rebuild parent_id for all descendants based on their new path
+      await this.sql`
+        UPDATE fs_nodes AS child
+        SET parent_id = parent.id
+        FROM fs_nodes AS parent
+        WHERE child.owner_id = ${this.userId}
+          AND parent.owner_id = ${this.userId}
+          AND child.path <@ ${newPrefix}::ltree
+          AND child.path != ${newPrefix}::ltree
+          AND parent.path = subltree(child.path, 0, nlevel(child.path) - 1)
+      `;
+    }
   }
 
   async chmod(path: string, mode: number): Promise<void> {
