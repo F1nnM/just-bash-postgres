@@ -1,6 +1,6 @@
 import postgres from "postgres";
 
-const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres@localhost:5432/just_bash_postgres_test";
+const TEST_DB_URL = process.env.TEST_DATABASE_URL ?? "postgres://postgres@localhost:5433/just_bash_postgres_test";
 
 export function createTestSql() {
   const url = new URL(TEST_DB_URL);
