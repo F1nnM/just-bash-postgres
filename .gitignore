@@ -19,3 +19,9 @@ refs
 .vscode/
 
 .claude
+
+# Build
+node_modules/
+dist/
+*.tgz
+.env
