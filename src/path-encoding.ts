@@ -15,7 +15,7 @@ export function encodeLabel(name: string): string {
     } else if (/[A-Za-z0-9_-]/.test(char)) {
       result += char;
     } else {
-      const hex = char.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0");
+      const hex = char.codePointAt(0)!.toString(16).toUpperCase().padStart(2, "0");
       result += `__${hex}__`;
     }
   }
@@ -27,7 +27,7 @@ export function decodeLabel(label: string): string {
     if (DECODE_MAP[match]) return DECODE_MAP[match];
     // Hex-encoded character
     const charCode = parseInt(code, 16);
-    if (!isNaN(charCode) && charCode > 0) return String.fromCharCode(charCode);
+    if (!isNaN(charCode) && charCode > 0) return String.fromCodePoint(charCode);
     return match; // shouldn't happen, return as-is
   });
 }

@@ -54,6 +54,13 @@ describe("decodeLabel", () => {
       expect(decodeLabel(encodeLabel(name))).toBe(name);
     }
   });
+
+  test("roundtrips emoji and non-BMP unicode", () => {
+    const names = ["\u{1F4C1}folder", "file\u{1F600}.txt", "\u{1F4DD}notes"];
+    for (const name of names) {
+      expect(decodeLabel(encodeLabel(name))).toBe(name);
+    }
+  });
 });
 
 describe("pathToLtree", () => {
