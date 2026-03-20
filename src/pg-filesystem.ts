@@ -102,16 +102,21 @@ export class PgFileSystem implements IFileSystem {
     return parts[parts.length - 1] || "/";
   }
 
+  private async resolveSymlink(path: string, maxDepth = 40): Promise<FsRow> {
+    const node = await this.getNode(path);
+    if (!node) throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+    if (node.node_type === "symlink" && node.symlink_target) {
+      if (maxDepth <= 0) throw new Error(`ELOOP: too many levels of symbolic links, open '${path}'`);
+      return this.resolveSymlink(node.symlink_target, maxDepth - 1);
+    }
+    return node;
+  }
+
   // -- File I/O ---------------------------------------------------------------
 
   async readFile(path: string, options?: ReadFileOptions | BufferEncoding): Promise<string> {
-    const node = await this.getNode(path);
-    if (!node) throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+    const node = await this.resolveSymlink(path);
     if (node.node_type === "directory") throw new Error(`EISDIR: illegal operation on a directory, read '${path}'`);
-
-    if (node.node_type === "symlink") {
-      return this.readFile(node.symlink_target!, options);
-    }
 
     if (node.content !== null) return node.content;
     if (node.binary_data !== null) return new TextDecoder().decode(node.binary_data);
@@ -119,13 +124,8 @@ export class PgFileSystem implements IFileSystem {
   }
 
   async readFileBuffer(path: string): Promise<Uint8Array> {
-    const node = await this.getNode(path);
-    if (!node) throw new Error(`ENOENT: no such file or directory, open '${path}'`);
+    const node = await this.resolveSymlink(path);
     if (node.node_type === "directory") throw new Error(`EISDIR: illegal operation on a directory, read '${path}'`);
-
-    if (node.node_type === "symlink") {
-      return this.readFileBuffer(node.symlink_target!);
-    }
 
     if (node.binary_data !== null) return node.binary_data;
     if (node.content !== null) return new TextEncoder().encode(node.content);
@@ -182,7 +182,8 @@ export class PgFileSystem implements IFileSystem {
     }
 
     const textContent = typeof content === "string" ? content : new TextDecoder().decode(content);
-    const currentContent = existing.content ?? "";
+    const currentContent = existing.content ??
+      (existing.binary_data ? new TextDecoder().decode(existing.binary_data) : "");
     const newContent = currentContent + textContent;
     const sizeBytes = Buffer.byteLength(newContent);
 
@@ -202,13 +203,12 @@ export class PgFileSystem implements IFileSystem {
   }
 
   async stat(path: string): Promise<FsStat> {
-    const node = await this.getNode(path);
-    if (!node) throw new Error(`ENOENT: no such file or directory, stat '${path}'`);
+    const node = await this.resolveSymlink(path);
 
     return {
       isFile: node.node_type === "file",
       isDirectory: node.node_type === "directory",
-      isSymbolicLink: node.node_type === "symlink",
+      isSymbolicLink: false, // stat follows symlinks, so result is never a symlink
       mode: node.mode,
       size: Number(node.size_bytes),
       mtime: new Date(node.mtime),
@@ -237,7 +237,8 @@ export class PgFileSystem implements IFileSystem {
     if (node.node_type === "symlink" && node.symlink_target) {
       return this.realpath(node.symlink_target);
     }
-    return path;
+    // Return the canonical path (the one stored in the database)
+    return ltreeToPath(node.path);
   }
 
   // -- Directory operations ----------------------------------------------------
