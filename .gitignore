@@ -1,0 +1,21 @@
+# Sandbox artifacts (0-byte files)
+.bash_profile
+.bashrc
+.gitconfig
+.gitmodules
+.mcp.json
+.profile
+.ripgreprc
+.zprofile
+.zshrc
+HEAD
+config
+hooks
+objects
+refs
+
+# IDE
+.idea/
+.vscode/
+
+.claude
