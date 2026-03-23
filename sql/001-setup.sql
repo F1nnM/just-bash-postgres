@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS fs_nodes (
     created_at      timestamptz NOT NULL DEFAULT now(),
     search_vector   tsvector GENERATED ALWAYS AS (
         setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
-        setweight(to_tsvector('english', coalesce(content, '')), 'C')
+        setweight(to_tsvector('english', left(coalesce(content, ''), 100000)), 'C')
     ) STORED,
 
     CONSTRAINT unique_session_path UNIQUE (session_id, path)
@@ -39,5 +39,14 @@ DO $$ BEGIN
         CREATE POLICY session_isolation ON fs_nodes FOR ALL
             USING (session_id = current_setting('app.session_id', true)::bigint)
             WITH CHECK (session_id = current_setting('app.session_id', true)::bigint);
+    END IF;
+END $$;
+
+-- Grant table permissions to app role if it exists (for RLS enforcement)
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'fs_app') THEN
+        EXECUTE 'GRANT SELECT, INSERT, UPDATE, DELETE ON fs_nodes TO fs_app';
+        EXECUTE 'GRANT USAGE ON SCHEMA public TO fs_app';
+        EXECUTE 'GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO fs_app';
     END IF;
 END $$;

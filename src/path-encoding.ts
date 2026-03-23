@@ -7,6 +7,8 @@ const DECODE_MAP: Record<string, string> = Object.fromEntries(
   Object.entries(SPECIAL_ENCODINGS).map(([k, v]) => [v, k])
 );
 
+const MAX_LTREE_LABEL_LENGTH = 255;
+
 export function encodeLabel(name: string): string {
   if (name.length === 0) throw new Error("Cannot encode empty filename");
   let result = "";
@@ -23,6 +25,9 @@ export function encodeLabel(name: string): string {
       const hex = char.codePointAt(0)!.toString(16).toUpperCase().padStart(2, "0");
       result += `__${hex}__`;
     }
+  }
+  if (result.length > MAX_LTREE_LABEL_LENGTH) {
+    throw new Error(`Encoded filename exceeds ltree label limit of ${MAX_LTREE_LABEL_LENGTH} characters`);
   }
   return result;
 }

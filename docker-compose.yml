@@ -10,6 +10,7 @@ services:
       - "5433:5432"
     volumes:
       - /tmp/pg_socket:/var/run/postgresql
+      - ./sql/init-test-roles.sql:/docker-entrypoint-initdb.d/init-test-roles.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s

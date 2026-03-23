@@ -151,7 +151,22 @@ const sql = postgres("postgres://user:pass@host:5432/db?sslmode=require");
 
 ### Row-Level Security
 
-The library sets `app.session_id` as a PostgreSQL session variable per transaction, which RLS policies reference to enforce isolation. For full RLS protection, use a non-superuser database role -- superusers bypass RLS entirely.
+The library enforces isolation at two levels: application-level `WHERE session_id = ...` on every query, and database-level RLS policies. **For RLS to be effective, the application must connect as a non-superuser role** -- PostgreSQL superusers bypass RLS entirely.
+
+`setup()` automatically grants the necessary table permissions to a role named `fs_app` if it exists. To create this role:
+
+```sql
+CREATE ROLE fs_app LOGIN PASSWORD 'your-password';
+GRANT CONNECT ON DATABASE your_db TO fs_app;
+```
+
+Then connect your application as `fs_app`:
+
+```typescript
+const sql = postgres("postgres://fs_app:your-password@localhost:5432/mydb");
+```
+
+Run `setup()` once with a superuser connection to create the schema, then switch to `fs_app` for normal operations.
 
 ### Defense in Depth
 

@@ -16,15 +16,15 @@ export async function setupVectorColumn(sql: postgres.Sql, dimensions: number): 
   }
   await sql.unsafe(`CREATE EXTENSION IF NOT EXISTS vector`);
 
-  const hasColumn = await sql`
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'fs_nodes' AND column_name = 'embedding'
-  `;
-  if (hasColumn.length === 0) {
-    await sql.unsafe(`ALTER TABLE fs_nodes ADD COLUMN embedding vector(${dimensions})`);
-    await sql.unsafe(`
-      CREATE INDEX IF NOT EXISTS idx_fs_embedding ON fs_nodes
-      USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
-    `);
-  }
+  await sql.unsafe(`
+    DO $$ BEGIN
+      ALTER TABLE fs_nodes ADD COLUMN embedding vector(${dimensions});
+    EXCEPTION WHEN duplicate_column THEN
+      NULL;
+    END $$
+  `);
+  await sql.unsafe(`
+    CREATE INDEX IF NOT EXISTS idx_fs_embedding ON fs_nodes
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
+  `);
 }

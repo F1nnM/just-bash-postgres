@@ -58,7 +58,7 @@ interface FsRow {
 }
 
 const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
-const MAX_SYMLINK_DEPTH = 40;
+const MAX_SYMLINK_DEPTH = 16;
 const MAX_PATH_DEPTH = 256;
 
 function fsError(code: string, op: string, path: string): Error {
@@ -73,7 +73,7 @@ export class PgFileSystem implements IFileSystem {
   private maxFileSize: number;
 
   constructor(options: PgFileSystemOptions) {
-    if (!Number.isInteger(options.sessionId) || options.sessionId < 1) {
+    if (!Number.isInteger(options.sessionId) || options.sessionId < 1 || options.sessionId > Number.MAX_SAFE_INTEGER) {
       throw new Error(`Invalid sessionId: must be a positive integer, got ${options.sessionId}`);
     }
     this.sql = options.sql;
@@ -107,6 +107,7 @@ export class PgFileSystem implements IFileSystem {
     // but has incompatible generic types. The cast is safe at runtime.
     return this.sql.begin(async (tx: any) => {
       await tx`SELECT set_config('app.session_id', ${String(this.sessionId)}, true)`;
+      await tx`SELECT set_config('statement_timeout', '30000', true)`;
       return fn(tx);
     }) as Promise<T>;
   }
@@ -164,7 +165,8 @@ export class PgFileSystem implements IFileSystem {
     tx: postgres.Sql,
     path: string,
     content: FileContent,
-    _options?: WriteFileOptions | BufferEncoding
+    _options?: WriteFileOptions | BufferEncoding,
+    precomputedEmbedding?: number[] | null
   ): Promise<void> {
     this.validateFileSize(content);
     this.validatePathDepth(path);
@@ -183,8 +185,8 @@ export class PgFileSystem implements IFileSystem {
     const binaryData = isText ? null : content;
     const sizeBytes = isText ? Buffer.byteLength(content) : content.byteLength;
 
-    let embedding: number[] | null = null;
-    if (isText && this.embed && content.length > 0) {
+    let embedding: number[] | null = precomputedEmbedding ?? null;
+    if (embedding === null && isText && this.embed && content.length > 0) {
       embedding = await this.embed(content);
       if (embedding) {
         validateEmbedding(embedding, this.embeddingDimensions);
@@ -337,8 +339,17 @@ export class PgFileSystem implements IFileSystem {
   }
 
   async writeFile(path: string, content: FileContent, options?: WriteFileOptions | BufferEncoding): Promise<void> {
+    const normalized = normalizePath(path);
+    // Compute embedding outside transaction to avoid holding connection during API calls
+    let embedding: number[] | null = null;
+    if (typeof content === "string" && this.embed && content.length > 0) {
+      embedding = await this.embed(content);
+      if (embedding) {
+        validateEmbedding(embedding, this.embeddingDimensions);
+      }
+    }
     return this.withSession(async (tx) => {
-      await this.internalWriteFile(tx, normalizePath(path), content, options);
+      await this.internalWriteFile(tx, normalized, content, options, embedding);
     });
   }
 

@@ -1,5 +1,5 @@
 import type postgres from "postgres";
-import { ltreeToPath, encodeLabel } from "./path-encoding";
+import { ltreeToPath, encodeLabel, normalizePath } from "./path-encoding";
 
 export interface SearchResult {
   path: string;
@@ -56,7 +56,7 @@ export async function fullTextSearch(
       path::text as path,
       name,
       ts_rank(search_vector, websearch_to_tsquery('english', ${query})) AS rank,
-      ts_headline('english', coalesce(content, ''), websearch_to_tsquery('english', ${query}),
+      ts_headline('english', left(coalesce(content, ''), 100000), websearch_to_tsquery('english', ${query}),
         'MaxWords=35, MinWords=15, MaxFragments=1') AS snippet
     FROM fs_nodes
     WHERE session_id = ${sessionId}
@@ -119,6 +119,9 @@ export async function hybridSearch(
   const limit = clampLimit(opts?.limit);
   const textWeight = opts?.textWeight ?? 0.4;
   const vectorWeight = opts?.vectorWeight ?? 0.6;
+  if (!Number.isFinite(textWeight) || !Number.isFinite(vectorWeight)) {
+    throw new Error("Search weights must be finite numbers");
+  }
   const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
   validateEmbedding(embedding);
   const embeddingStr = `[${embedding.join(",")}]`;
@@ -148,7 +151,8 @@ export async function hybridSearch(
 
 function buildScopeLtree(ltreePrefix: string, path?: string): string {
   if (!path || path === "/") return ltreePrefix;
-  const segments = path.split("/").filter(Boolean);
+  const normalized = normalizePath(path);
+  const segments = normalized.split("/").filter(Boolean);
   const encodedSegments = segments.map(encodeLabel);
   return ltreePrefix + "." + encodedSegments.join(".");
 }
