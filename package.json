@@ -1,15 +1,25 @@
 {
   "name": "just-bash-postgres",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "PostgreSQL filesystem provider for just-bash with ltree, FTS, vector search, and RLS",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "module": "src/index.ts",
   "type": "module",
-  "files": ["src", "sql"],
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    }
+  },
+  "files": [
+    "src",
+    "sql"
+  ],
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run typecheck"
   },
   "keywords": [
     "just-bash",
@@ -17,8 +27,24 @@
     "postgresql",
     "ltree",
     "vector-search",
-    "full-text-search"
+    "full-text-search",
+    "pgvector",
+    "rls",
+    "multi-tenant"
   ],
+  "license": "MIT",
+  "author": "Finn",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/F1nnM/just-bash-postgres.git"
+  },
+  "homepage": "https://github.com/F1nnM/just-bash-postgres#readme",
+  "bugs": {
+    "url": "https://github.com/F1nnM/just-bash-postgres/issues"
+  },
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "devDependencies": {
     "@types/bun": "^1.2.0",
     "just-bash": "^2.14.0"
