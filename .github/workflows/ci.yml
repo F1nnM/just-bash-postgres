@@ -40,7 +40,28 @@ jobs:
       - name: Typecheck
         run: bun run typecheck
 
-      - name: Test
-        run: bun test
+      - name: Test with coverage
+        run: bun test --coverage --coverage-reporter=lcov
         env:
           TEST_DATABASE_URL: postgres://postgres@localhost:5433/just_bash_postgres_test
+
+      - name: Generate coverage badge
+        if: github.ref == 'refs/heads/main'
+        run: |
+          COVERAGE=$(awk -F: '/^LF:/{total+=$2} /^LH:/{hit+=$2} END{printf "%.0f", (hit/total)*100}' coverage/lcov.info)
+          if [ "$COVERAGE" -ge 90 ]; then COLOR="brightgreen"
+          elif [ "$COVERAGE" -ge 75 ]; then COLOR="green"
+          elif [ "$COVERAGE" -ge 60 ]; then COLOR="yellow"
+          else COLOR="red"; fi
+          mkdir -p badge
+          cat > badge/coverage.json <<EOF
+          {"schemaVersion":1,"label":"coverage","message":"${COVERAGE}%","color":"${COLOR}"}
+          EOF
+
+      - name: Deploy badge to GitHub Pages
+        if: github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./badge
+          keep_files: true
