@@ -286,7 +286,7 @@ export class PgFileSystem implements IFileSystem {
       const existingRows = await tx<{ path: string; node_type: string }[]>`
         SELECT path::text, node_type FROM fs_nodes
         WHERE session_id = ${this.sessionId}
-          AND path = ANY(${allLtrees}::ltree[])
+          AND path = ANY(${allLtrees}::text[]::ltree[])
       `;
       const existingMap = new Map(existingRows.map(r => [r.path, r.node_type]));
 
