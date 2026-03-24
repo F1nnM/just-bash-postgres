@@ -19,6 +19,7 @@ refs
 .vscode/
 
 .claude
+docs/
 
 # Build
 node_modules
