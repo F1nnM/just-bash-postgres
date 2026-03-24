@@ -1,7 +1,7 @@
 # just-bash-postgres
 
 [![CI](https://github.com/F1nnM/just-bash-postgres/actions/workflows/ci.yml/badge.svg)](https://github.com/F1nnM/just-bash-postgres/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/endpoint?url=https://f1nnm.github.io/just-bash-postgres/coverage.json)](https://github.com/F1nnM/just-bash-postgres/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/endpoint?url=https%3A%2F%2Ff1nnm.github.io%2Fjust-bash-postgres%2Fcoverage.json)](https://github.com/F1nnM/just-bash-postgres/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/just-bash-postgres)](https://www.npmjs.com/package/just-bash-postgres)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
