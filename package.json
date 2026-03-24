@@ -20,13 +20,13 @@
     "full-text-search"
   ],
   "devDependencies": {
-    "@types/bun": "^1.2.0"
+    "@types/bun": "^1.2.0",
+    "just-bash": "^2.14.0"
   },
   "peerDependencies": {
     "just-bash": "^2.14.0"
   },
   "dependencies": {
-    "just-bash": "^2.14.0",
     "postgres": "^3.4.8"
   }
 }

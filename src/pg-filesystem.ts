@@ -8,7 +8,7 @@ import type {
   BufferEncoding,
   FileContent,
 } from "just-bash";
-import { pathToLtree, ltreeToPath, normalizePath, encodeLabel, decodeLabel } from "./path-encoding";
+import { pathToLtree, ltreeToPath, normalizePath } from "./path-encoding";
 import { setupSchema, setupVectorColumn } from "./schema";
 import {
   fullTextSearch,
@@ -39,6 +39,15 @@ export interface PgFileSystemOptions {
   embed?: (text: string) => Promise<number[]>;
   embeddingDimensions?: number;
   maxFileSize?: number;
+  statementTimeoutMs?: number;
+}
+
+export class FsError extends Error {
+  code: string;
+  constructor(code: string, op: string, path: string) {
+    super(`${code}: ${op}, '${path}'`);
+    this.code = code;
+  }
 }
 
 interface FsRow {
@@ -57,13 +66,12 @@ interface FsRow {
   created_at: Date;
 }
 
+type FsRowMeta = Omit<FsRow, "content" | "binary_data">;
+
 const DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024; // 100 MB
 const MAX_SYMLINK_DEPTH = 16;
 const MAX_PATH_DEPTH = 256;
-
-function fsError(code: string, op: string, path: string): Error {
-  return new Error(`${code}: ${op}, '${path}'`);
-}
+const MAX_CP_NODES = 10000;
 
 export class PgFileSystem implements IFileSystem {
   private sql: postgres.Sql;
@@ -71,6 +79,7 @@ export class PgFileSystem implements IFileSystem {
   private embed?: (text: string) => Promise<number[]>;
   private embeddingDimensions?: number;
   private maxFileSize: number;
+  private statementTimeoutMs: number;
 
   constructor(options: PgFileSystemOptions) {
     if (!Number.isInteger(options.sessionId) || options.sessionId < 1 || options.sessionId > Number.MAX_SAFE_INTEGER) {
@@ -81,6 +90,7 @@ export class PgFileSystem implements IFileSystem {
     this.embed = options.embed;
     this.embeddingDimensions = options.embeddingDimensions;
     this.maxFileSize = options.maxFileSize ?? DEFAULT_MAX_FILE_SIZE;
+    this.statementTimeoutMs = options.statementTimeoutMs ?? 30000;
   }
 
   async setup(): Promise<void> {
@@ -94,7 +104,7 @@ export class PgFileSystem implements IFileSystem {
       const rootLtree = pathToLtree("/", this.sessionId);
       await tx`
         INSERT INTO fs_nodes (session_id, name, node_type, path, mode)
-        VALUES (${this.sessionId}, '/', 'directory', ${rootLtree}::ltree, 755)
+        VALUES (${this.sessionId}, '/', 'directory', ${rootLtree}::ltree, ${0o755})
         ON CONFLICT (session_id, path) DO NOTHING
       `;
     });
@@ -107,7 +117,7 @@ export class PgFileSystem implements IFileSystem {
     // but has incompatible generic types. The cast is safe at runtime.
     return this.sql.begin(async (tx: any) => {
       await tx`SELECT set_config('app.session_id', ${String(this.sessionId)}, true)`;
-      await tx`SELECT set_config('statement_timeout', '30000', true)`;
+      await tx`SELECT set_config('statement_timeout', ${String(this.statementTimeoutMs)}, true)`;
       return fn(tx);
     }) as Promise<T>;
   }
@@ -124,12 +134,44 @@ export class PgFileSystem implements IFileSystem {
     return rows.length > 0 ? rows[0] : null;
   }
 
+  private async getNodeMeta(tx: postgres.Sql, posixPath: string): Promise<FsRowMeta | null> {
+    const lt = pathToLtree(posixPath, this.sessionId);
+    const rows = await tx<FsRowMeta[]>`
+      SELECT id, session_id, parent_id, name, node_type, path, symlink_target, mode, size_bytes, mtime, created_at
+      FROM fs_nodes
+      WHERE session_id = ${this.sessionId} AND path = ${lt}::ltree
+      LIMIT 1
+    `;
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  private async getNodeForUpdate(tx: postgres.Sql, posixPath: string): Promise<FsRow | null> {
+    const lt = pathToLtree(posixPath, this.sessionId);
+    const rows = await tx<FsRow[]>`
+      SELECT * FROM fs_nodes
+      WHERE session_id = ${this.sessionId} AND path = ${lt}::ltree
+      LIMIT 1
+      FOR UPDATE
+    `;
+    return rows.length > 0 ? rows[0] : null;
+  }
+
   private async resolveSymlink(tx: postgres.Sql, path: string, maxDepth = MAX_SYMLINK_DEPTH): Promise<FsRow> {
     const node = await this.getNode(tx, path);
-    if (!node) throw fsError("ENOENT", "no such file or directory", path);
+    if (!node) throw new FsError("ENOENT", "no such file or directory", path);
     if (node.node_type === "symlink" && node.symlink_target) {
-      if (maxDepth <= 0) throw fsError("ELOOP", "too many levels of symbolic links", path);
+      if (maxDepth <= 0) throw new FsError("ELOOP", "too many levels of symbolic links", path);
       return this.resolveSymlink(tx, normalizePath(node.symlink_target), maxDepth - 1);
+    }
+    return node;
+  }
+
+  private async resolveSymlinkMeta(tx: postgres.Sql, path: string, maxDepth = MAX_SYMLINK_DEPTH): Promise<FsRowMeta> {
+    const node = await this.getNodeMeta(tx, path);
+    if (!node) throw new FsError("ENOENT", "no such file or directory", path);
+    if (node.node_type === "symlink" && node.symlink_target) {
+      if (maxDepth <= 0) throw new FsError("ELOOP", "too many levels of symbolic links", path);
+      return this.resolveSymlinkMeta(tx, normalizePath(node.symlink_target), maxDepth - 1);
     }
     return node;
   }
@@ -161,6 +203,7 @@ export class PgFileSystem implements IFileSystem {
 
   // -- Internal write (shared by writeFile, appendFile, link, cp) -------------
 
+  // precomputedEmbedding: undefined = compute if possible, null = skip embedding
   private async internalWriteFile(
     tx: postgres.Sql,
     path: string,
@@ -173,11 +216,11 @@ export class PgFileSystem implements IFileSystem {
 
     const name = this.fileName(path);
     const parentPosix = this.parentPath(path);
-    const parent = await this.getNode(tx, parentPosix);
-    if (!parent) throw fsError("ENOENT", "no such file or directory, open", path);
+    const parent = await this.getNodeMeta(tx, parentPosix);
+    if (!parent) throw new FsError("ENOENT", "no such file or directory, open", path);
 
-    const existing = await this.getNode(tx, path);
-    if (existing?.node_type === "directory") throw fsError("EISDIR", "illegal operation on a directory, open", path);
+    const existing = await this.getNodeMeta(tx, path);
+    if (existing?.node_type === "directory") throw new FsError("EISDIR", "illegal operation on a directory, open", path);
 
     const lt = pathToLtree(path, this.sessionId);
     const isText = typeof content === "string";
@@ -185,8 +228,10 @@ export class PgFileSystem implements IFileSystem {
     const binaryData = isText ? null : content;
     const sizeBytes = isText ? Buffer.byteLength(content) : content.byteLength;
 
-    let embedding: number[] | null = precomputedEmbedding ?? null;
-    if (embedding === null && isText && this.embed && content.length > 0) {
+    let embedding: number[] | null = null;
+    if (precomputedEmbedding !== undefined) {
+      embedding = precomputedEmbedding;
+    } else if (isText && this.embed && content.length > 0) {
       embedding = await this.embed(content);
       if (embedding) {
         validateEmbedding(embedding, this.embeddingDimensions);
@@ -226,37 +271,61 @@ export class PgFileSystem implements IFileSystem {
 
     if (recursive) {
       const segments = path.split("/").filter(Boolean);
+
+      const allPaths: string[] = [];
+      const allLtrees: string[] = [];
+      const allNames: string[] = [];
       let current = "/";
       for (const segment of segments) {
-        const parentPosix = current;
         current = current === "/" ? `/${segment}` : `${current}/${segment}`;
-        const existing = await this.getNode(tx, current);
-        if (existing) {
-          if (existing.node_type !== "directory") {
-            throw fsError("ENOTDIR", "not a directory, mkdir", current);
-          }
-          continue;
+        allPaths.push(current);
+        allLtrees.push(pathToLtree(current, this.sessionId));
+        allNames.push(segment);
+      }
+
+      const existingRows = await tx<{ path: string; node_type: string }[]>`
+        SELECT path::text, node_type FROM fs_nodes
+        WHERE session_id = ${this.sessionId}
+          AND path = ANY(${allLtrees}::ltree[])
+      `;
+      const existingMap = new Map(existingRows.map(r => [r.path, r.node_type]));
+
+      for (let i = 0; i < allLtrees.length; i++) {
+        const nodeType = existingMap.get(allLtrees[i]);
+        if (nodeType && nodeType !== "directory") {
+          throw new FsError("ENOTDIR", "not a directory, mkdir", allPaths[i]);
         }
-        const parent = await this.getNode(tx, parentPosix);
-        if (!parent) throw fsError("ENOENT", "no such file or directory, mkdir", current);
-        const lt = pathToLtree(current, this.sessionId);
+      }
+
+      const toCreate: { name: string; ltree: string; parentLtree: string }[] = [];
+      for (let i = 0; i < allLtrees.length; i++) {
+        if (!existingMap.has(allLtrees[i])) {
+          const parentLt = i === 0 ? pathToLtree("/", this.sessionId) : allLtrees[i - 1];
+          toCreate.push({ name: allNames[i], ltree: allLtrees[i], parentLtree: parentLt });
+        }
+      }
+
+      for (const dir of toCreate) {
         await tx`
           INSERT INTO fs_nodes (session_id, parent_id, name, node_type, path, mode)
-          VALUES (${this.sessionId}, ${parent.id}, ${segment}, 'directory', ${lt}::ltree, 755)
+          SELECT ${this.sessionId}, p.id, ${dir.name}, 'directory', ${dir.ltree}::ltree, ${0o755}
+          FROM fs_nodes p
+          WHERE p.session_id = ${this.sessionId}
+            AND p.path = ${dir.parentLtree}::ltree
           ON CONFLICT (session_id, path) DO NOTHING
         `;
       }
     } else {
-      const existing = await this.getNode(tx, path);
-      if (existing) throw fsError("EEXIST", "file already exists, mkdir", path);
+      const existing = await this.getNodeMeta(tx, path);
+      if (existing) throw new FsError("EEXIST", "file already exists, mkdir", path);
       const parentPosix = this.parentPath(path);
-      const parent = await this.getNode(tx, parentPosix);
-      if (!parent) throw fsError("ENOENT", "no such file or directory, mkdir", path);
+      const parent = await this.getNodeMeta(tx, parentPosix);
+      if (!parent) throw new FsError("ENOENT", "no such file or directory, mkdir", path);
       const name = this.fileName(path);
       const lt = pathToLtree(path, this.sessionId);
       await tx`
         INSERT INTO fs_nodes (session_id, parent_id, name, node_type, path, mode)
-        VALUES (${this.sessionId}, ${parent.id}, ${name}, 'directory', ${lt}::ltree, 755)
+        VALUES (${this.sessionId}, ${parent.id}, ${name}, 'directory', ${lt}::ltree, ${0o755})
       `;
     }
   }
@@ -264,17 +333,13 @@ export class PgFileSystem implements IFileSystem {
   // -- Internal readdir (shared by readdir, cp) -------------------------------
 
   private async internalReaddir(tx: postgres.Sql, path: string): Promise<string[]> {
-    const node = await this.getNode(tx, path);
-    if (!node) throw fsError("ENOENT", "no such file or directory, scandir", path);
-    if (node.node_type !== "directory") throw fsError("ENOTDIR", "not a directory, scandir", path);
+    const node = await this.getNodeMeta(tx, path);
+    if (!node) throw new FsError("ENOENT", "no such file or directory, scandir", path);
+    if (node.node_type !== "directory") throw new FsError("ENOTDIR", "not a directory, scandir", path);
 
-    const lt = pathToLtree(path, this.sessionId);
-    const depth = lt.split(".").length + 1;
     const rows = await tx<{ name: string }[]>`
       SELECT name FROM fs_nodes
-      WHERE session_id = ${this.sessionId}
-        AND path <@ ${lt}::ltree
-        AND nlevel(path) = ${depth}
+      WHERE session_id = ${this.sessionId} AND parent_id = ${node.id}
       ORDER BY name
     `;
     return rows.map(r => r.name);
@@ -282,38 +347,47 @@ export class PgFileSystem implements IFileSystem {
 
   // -- Internal cp (recursive, stays in same tx) -----------------------------
 
-  private async internalCp(tx: postgres.Sql, src: string, dest: string, options?: CpOptions): Promise<void> {
-    // Overlap detection
+  private async internalCp(
+    tx: postgres.Sql, src: string, dest: string, options?: CpOptions, counter?: { count: number }
+  ): Promise<void> {
+    const nodeCounter = counter ?? { count: 0 };
+
     if (dest.startsWith(src + "/") || dest === src) {
-      throw new Error(`EINVAL: cannot copy '${src}' to a subdirectory of itself '${dest}'`);
+      throw new FsError("EINVAL", "cannot copy to a subdirectory of itself, cp", src);
     }
 
     const srcNode = await this.getNode(tx, src);
-    if (!srcNode) throw fsError("ENOENT", "no such file or directory, cp", src);
+    if (!srcNode) throw new FsError("ENOENT", "no such file or directory, cp", src);
+
+    nodeCounter.count++;
+    if (nodeCounter.count > MAX_CP_NODES) {
+      throw new Error(`cp: too many nodes (exceeds limit of ${MAX_CP_NODES})`);
+    }
 
     if (srcNode.node_type === "directory") {
       if (!options?.recursive) {
-        throw fsError("EISDIR", "illegal operation on a directory, cp", src);
+        throw new FsError("EISDIR", "illegal operation on a directory, cp", src);
       }
       await this.internalMkdir(tx, dest, { recursive: true });
       const children = await this.internalReaddir(tx, src);
       for (const child of children) {
         const srcChild = src === "/" ? `/${child}` : `${src}/${child}`;
         const destChild = dest === "/" ? `/${child}` : `${dest}/${child}`;
-        await this.internalCp(tx, srcChild, destChild, options);
+        await this.internalCp(tx, srcChild, destChild, options, nodeCounter);
       }
       return;
     }
 
+    // Skip re-embedding for copies
     const content = srcNode.content !== null ? srcNode.content : await this.internalReadFileBuffer(tx, src);
-    await this.internalWriteFile(tx, dest, content);
+    await this.internalWriteFile(tx, dest, content, undefined, null);
   }
 
   // -- Internal readFileBuffer (shared by readFileBuffer, link, cp) ----------
 
   private async internalReadFileBuffer(tx: postgres.Sql, path: string): Promise<Uint8Array> {
     const node = await this.resolveSymlink(tx, path);
-    if (node.node_type === "directory") throw fsError("EISDIR", "illegal operation on a directory, read", path);
+    if (node.node_type === "directory") throw new FsError("EISDIR", "illegal operation on a directory, read", path);
     if (node.binary_data !== null) return node.binary_data;
     if (node.content !== null) return new TextEncoder().encode(node.content);
     return new Uint8Array(0);
@@ -321,11 +395,12 @@ export class PgFileSystem implements IFileSystem {
 
   // -- File I/O ---------------------------------------------------------------
 
+  // Encoding options are ignored; always returns UTF-8 text for interface compatibility.
   async readFile(path: string, _options?: ReadFileOptions | BufferEncoding): Promise<string> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
       const node = await this.resolveSymlink(tx, p);
-      if (node.node_type === "directory") throw fsError("EISDIR", "illegal operation on a directory, read", path);
+      if (node.node_type === "directory") throw new FsError("EISDIR", "illegal operation on a directory, read", path);
       if (node.content !== null) return node.content;
       if (node.binary_data !== null) return new TextDecoder().decode(node.binary_data);
       return "";
@@ -338,6 +413,7 @@ export class PgFileSystem implements IFileSystem {
     });
   }
 
+  // Encoding options are ignored; content is stored as-is (UTF-8 text or binary) for interface compatibility.
   async writeFile(path: string, content: FileContent, options?: WriteFileOptions | BufferEncoding): Promise<void> {
     const normalized = normalizePath(path);
     // Compute embedding outside transaction to avoid holding connection during API calls
@@ -353,18 +429,32 @@ export class PgFileSystem implements IFileSystem {
     });
   }
 
+  // Encoding options are ignored; content is stored as-is (UTF-8 text or binary) for interface compatibility.
   async appendFile(path: string, content: FileContent, _options?: WriteFileOptions | BufferEncoding): Promise<void> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const existing = await this.getNode(tx, p);
+      const existing = await this.getNodeForUpdate(tx, p);
       if (!existing) {
         await this.internalWriteFile(tx, p, content);
         return;
       }
-      const textContent = typeof content === "string" ? content : new TextDecoder().decode(content);
-      const currentContent = existing.content ??
-        (existing.binary_data ? new TextDecoder().decode(existing.binary_data) : "");
-      await this.internalWriteFile(tx, p, currentContent + textContent);
+
+      const appendSize = typeof content === "string" ? Buffer.byteLength(content) : content.byteLength;
+      if (existing.size_bytes + appendSize > this.maxFileSize) {
+        throw new Error(`File too large: ${existing.size_bytes + appendSize} bytes exceeds maximum of ${this.maxFileSize} bytes`);
+      }
+
+      if (existing.binary_data !== null || typeof content !== "string") {
+        const existingBytes = existing.binary_data ?? (existing.content !== null ? new TextEncoder().encode(existing.content) : new Uint8Array(0));
+        const appendBytes = typeof content === "string" ? new TextEncoder().encode(content) : content;
+        const merged = new Uint8Array(existingBytes.byteLength + appendBytes.byteLength);
+        merged.set(existingBytes, 0);
+        merged.set(appendBytes, existingBytes.byteLength);
+        await this.internalWriteFile(tx, p, merged);
+      } else {
+        const currentContent = existing.content ?? "";
+        await this.internalWriteFile(tx, p, currentContent + content);
+      }
     });
   }
 
@@ -372,14 +462,14 @@ export class PgFileSystem implements IFileSystem {
 
   async exists(path: string): Promise<boolean> {
     return this.withSession(async (tx) => {
-      const node = await this.getNode(tx, normalizePath(path));
+      const node = await this.getNodeMeta(tx, normalizePath(path));
       return node !== null;
     });
   }
 
   async stat(path: string): Promise<FsStat> {
     return this.withSession(async (tx) => {
-      const node = await this.resolveSymlink(tx, normalizePath(path));
+      const node = await this.resolveSymlinkMeta(tx, normalizePath(path));
       return {
         isFile: node.node_type === "file",
         isDirectory: node.node_type === "directory",
@@ -394,8 +484,8 @@ export class PgFileSystem implements IFileSystem {
   async lstat(path: string): Promise<FsStat> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const node = await this.getNode(tx, p);
-      if (!node) throw fsError("ENOENT", "no such file or directory, lstat", path);
+      const node = await this.getNodeMeta(tx, p);
+      if (!node) throw new FsError("ENOENT", "no such file or directory, lstat", path);
       return {
         isFile: node.node_type === "file",
         isDirectory: node.node_type === "directory",
@@ -414,10 +504,10 @@ export class PgFileSystem implements IFileSystem {
   }
 
   private async internalRealpath(tx: postgres.Sql, path: string, maxDepth = MAX_SYMLINK_DEPTH): Promise<string> {
-    const node = await this.getNode(tx, path);
-    if (!node) throw fsError("ENOENT", "no such file or directory, realpath", path);
+    const node = await this.getNodeMeta(tx, path);
+    if (!node) throw new FsError("ENOENT", "no such file or directory, realpath", path);
     if (node.node_type === "symlink" && node.symlink_target) {
-      if (maxDepth <= 0) throw fsError("ELOOP", "too many levels of symbolic links, realpath", path);
+      if (maxDepth <= 0) throw new FsError("ELOOP", "too many levels of symbolic links, realpath", path);
       return this.internalRealpath(tx, normalizePath(node.symlink_target), maxDepth - 1);
     }
     return ltreeToPath(node.path);
@@ -440,17 +530,13 @@ export class PgFileSystem implements IFileSystem {
   async readdirWithFileTypes(path: string): Promise<DirentEntry[]> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const node = await this.getNode(tx, p);
-      if (!node) throw fsError("ENOENT", "no such file or directory, scandir", path);
-      if (node.node_type !== "directory") throw fsError("ENOTDIR", "not a directory, scandir", path);
+      const node = await this.getNodeMeta(tx, p);
+      if (!node) throw new FsError("ENOENT", "no such file or directory, scandir", path);
+      if (node.node_type !== "directory") throw new FsError("ENOTDIR", "not a directory, scandir", path);
 
-      const lt = pathToLtree(p, this.sessionId);
-      const depth = lt.split(".").length + 1;
       const rows = await tx<{ name: string; node_type: string }[]>`
         SELECT name, node_type FROM fs_nodes
-        WHERE session_id = ${this.sessionId}
-          AND path <@ ${lt}::ltree
-          AND nlevel(path) = ${depth}
+        WHERE session_id = ${this.sessionId} AND parent_id = ${node.id}
         ORDER BY name
       `;
       return rows.map(r => ({
@@ -467,10 +553,10 @@ export class PgFileSystem implements IFileSystem {
   async rm(path: string, options?: RmOptions): Promise<void> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const node = await this.getNode(tx, p);
+      const node = await this.getNodeMeta(tx, p);
       if (!node) {
         if (options?.force) return;
-        throw fsError("ENOENT", "no such file or directory, rm", path);
+        throw new FsError("ENOENT", "no such file or directory, rm", path);
       }
 
       if (node.node_type === "directory") {
@@ -481,7 +567,7 @@ export class PgFileSystem implements IFileSystem {
             LIMIT 1
           `;
           if (children.length > 0) {
-            throw fsError("ENOTEMPTY", "directory not empty, rm", path);
+            throw new FsError("ENOTEMPTY", "directory not empty, rm", path);
           }
         }
       }
@@ -512,31 +598,56 @@ export class PgFileSystem implements IFileSystem {
       const srcPath = normalizePath(src);
       const destPath = normalizePath(dest);
 
-      // Overlap detection
       if (destPath.startsWith(srcPath + "/") || destPath === srcPath) {
-        throw new Error(`EINVAL: cannot move '${src}' to a subdirectory of itself '${dest}'`);
+        throw new FsError("EINVAL", "cannot move to a subdirectory of itself, mv", src);
       }
 
-      const srcNode = await this.getNode(tx, srcPath);
-      if (!srcNode) throw fsError("ENOENT", "no such file or directory, mv", src);
+      const srcNode = await this.getNodeForUpdate(tx, srcPath);
+      if (!srcNode) throw new FsError("ENOENT", "no such file or directory, mv", src);
 
       const destParentPosix = this.parentPath(destPath);
-      const destParent = await this.getNode(tx, destParentPosix);
-      if (!destParent) throw fsError("ENOENT", "no such file or directory, mv", dest);
+      const destParent = await this.getNodeMeta(tx, destParentPosix);
+      if (!destParent) throw new FsError("ENOENT", "no such file or directory, mv", dest);
+
+      // Handle existing destination
+      const destNode = await this.getNodeMeta(tx, destPath);
+      if (destNode) {
+        if (destNode.node_type === "directory" && srcNode.node_type !== "directory") {
+          throw new FsError("EISDIR", "cannot overwrite directory with non-directory, mv", dest);
+        }
+        if (destNode.node_type !== "directory" && srcNode.node_type === "directory") {
+          throw new FsError("ENOTDIR", "cannot overwrite non-directory with directory, mv", dest);
+        }
+        if (destNode.node_type === "directory") {
+          const children = await tx`
+            SELECT 1 FROM fs_nodes
+            WHERE session_id = ${this.sessionId} AND parent_id = ${destNode.id}
+            LIMIT 1
+          `;
+          if (children.length > 0) {
+            throw new FsError("ENOTEMPTY", "directory not empty, mv", dest);
+          }
+        }
+        await tx`
+          DELETE FROM fs_nodes
+          WHERE session_id = ${this.sessionId} AND id = ${destNode.id}
+        `;
+      }
 
       const newName = this.fileName(destPath);
       const newLtree = pathToLtree(destPath, this.sessionId);
       const oldLtree = pathToLtree(srcPath, this.sessionId);
 
-      // Update the node itself
-      await tx`
+      const updated = await tx`
         UPDATE fs_nodes
         SET name = ${newName}, path = ${newLtree}::ltree, parent_id = ${destParent.id}, mtime = now()
         WHERE session_id = ${this.sessionId} AND id = ${srcNode.id}
       `;
+      if (updated.count === 0) {
+        throw new FsError("ENOENT", "no such file or directory, mv", src);
+      }
 
       if (srcNode.node_type === "directory") {
-        // Update all descendants' paths
         await tx`
           UPDATE fs_nodes
           SET path = (${newLtree}::ltree || subpath(path, nlevel(${oldLtree}::ltree)))
@@ -544,7 +655,6 @@ export class PgFileSystem implements IFileSystem {
             AND path <@ ${oldLtree}::ltree
         `;
 
-        // Rebuild parent_id for all descendants based on new paths
         await tx`
           UPDATE fs_nodes AS child
           SET parent_id = parent.id
@@ -560,10 +670,13 @@ export class PgFileSystem implements IFileSystem {
   }
 
   async chmod(path: string, mode: number): Promise<void> {
+    if (!Number.isInteger(mode) || mode < 0 || mode > 0o7777) {
+      throw new Error(`Invalid mode: ${mode} (must be integer between 0 and 4095/0o7777)`);
+    }
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const node = await this.getNode(tx, p);
-      if (!node) throw fsError("ENOENT", "no such file or directory, chmod", path);
+      const node = await this.getNodeMeta(tx, p);
+      if (!node) throw new FsError("ENOENT", "no such file or directory, chmod", path);
       await tx`
         UPDATE fs_nodes SET mode = ${mode}
         WHERE session_id = ${this.sessionId} AND id = ${node.id}
@@ -574,8 +687,8 @@ export class PgFileSystem implements IFileSystem {
   async utimes(path: string, _atime: Date, mtime: Date): Promise<void> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const node = await this.getNode(tx, p);
-      if (!node) throw fsError("ENOENT", "no such file or directory, utimes", path);
+      const node = await this.getNodeMeta(tx, p);
+      if (!node) throw new FsError("ENOENT", "no such file or directory, utimes", path);
       await tx`
         UPDATE fs_nodes SET mtime = ${mtime}
         WHERE session_id = ${this.sessionId} AND id = ${node.id}
@@ -593,27 +706,29 @@ export class PgFileSystem implements IFileSystem {
       if (normalizedTarget.length > 4096) {
         throw new Error("Symlink target exceeds maximum length of 4096 characters");
       }
+      this.validatePathDepth(normalizedTarget);
 
       const parentPosix = this.parentPath(p);
-      const parent = await this.getNode(tx, parentPosix);
-      if (!parent) throw fsError("ENOENT", "no such file or directory, symlink", linkPath);
+      const parent = await this.getNodeMeta(tx, parentPosix);
+      if (!parent) throw new FsError("ENOENT", "no such file or directory, symlink", linkPath);
 
       const name = this.fileName(p);
       const lt = pathToLtree(p, this.sessionId);
 
       await tx`
         INSERT INTO fs_nodes (session_id, parent_id, name, node_type, path, symlink_target, mode)
-        VALUES (${this.sessionId}, ${parent.id}, ${name}, 'symlink', ${lt}::ltree, ${normalizedTarget}, 777)
+        VALUES (${this.sessionId}, ${parent.id}, ${name}, 'symlink', ${lt}::ltree, ${normalizedTarget}, ${0o777})
       `;
     });
   }
 
+  // Creates a copy of the file content rather than a true POSIX hard link (no shared inode).
   async link(existingPath: string, newPath: string): Promise<void> {
     return this.withSession(async (tx) => {
       const src = normalizePath(existingPath);
       const srcNode = await this.getNode(tx, src);
-      if (!srcNode) throw fsError("ENOENT", "no such file or directory, link", existingPath);
-      if (srcNode.node_type === "directory") throw fsError("EPERM", "operation not permitted, link", existingPath);
+      if (!srcNode) throw new FsError("ENOENT", "no such file or directory, link", existingPath);
+      if (srcNode.node_type === "directory") throw new FsError("EPERM", "operation not permitted, link", existingPath);
 
       const content = srcNode.content !== null ? srcNode.content : await this.internalReadFileBuffer(tx, src);
       await this.internalWriteFile(tx, normalizePath(newPath), content);
@@ -623,10 +738,13 @@ export class PgFileSystem implements IFileSystem {
   async readlink(path: string): Promise<string> {
     return this.withSession(async (tx) => {
       const p = normalizePath(path);
-      const node = await this.getNode(tx, p);
-      if (!node) throw fsError("ENOENT", "no such file or directory, readlink", path);
-      if (node.node_type !== "symlink") throw fsError("EINVAL", "invalid argument, readlink", path);
-      return node.symlink_target!;
+      const node = await this.getNodeMeta(tx, p);
+      if (!node) throw new FsError("ENOENT", "no such file or directory, readlink", path);
+      if (node.node_type !== "symlink") throw new FsError("EINVAL", "invalid argument, readlink", path);
+      if (node.symlink_target === null) {
+        throw new Error(`Corrupt symlink node at '${path}': symlink_target is null`);
+      }
+      return node.symlink_target;
     });
   }
 
@@ -646,8 +764,7 @@ export class PgFileSystem implements IFileSystem {
 
   async search(query: string, opts?: { path?: string; limit?: number }): Promise<SearchResult[]> {
     return this.withSession(async (tx) => {
-      const ltreePrefix = pathToLtree("/", this.sessionId);
-      return fullTextSearch(tx, this.sessionId, ltreePrefix, query, opts);
+      return fullTextSearch(tx, this.sessionId, query, opts);
     });
   }
 
@@ -656,8 +773,7 @@ export class PgFileSystem implements IFileSystem {
     const embedding = await this.embed(query);
     validateEmbedding(embedding, this.embeddingDimensions);
     return this.withSession(async (tx) => {
-      const ltreePrefix = pathToLtree("/", this.sessionId);
-      return doSemanticSearch(tx, this.sessionId, ltreePrefix, embedding, opts);
+      return doSemanticSearch(tx, this.sessionId, embedding, opts);
     });
   }
 
@@ -671,8 +787,7 @@ export class PgFileSystem implements IFileSystem {
     const embedding = await this.embed(query);
     validateEmbedding(embedding, this.embeddingDimensions);
     return this.withSession(async (tx) => {
-      const ltreePrefix = pathToLtree("/", this.sessionId);
-      return doHybridSearch(tx, this.sessionId, ltreePrefix, query, embedding, opts);
+      return doHybridSearch(tx, this.sessionId, query, embedding, opts);
     });
   }
 }

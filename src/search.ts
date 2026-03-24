@@ -1,5 +1,5 @@
 import type postgres from "postgres";
-import { ltreeToPath, encodeLabel, normalizePath } from "./path-encoding";
+import { ltreeToPath, pathToLtree } from "./path-encoding";
 
 export interface SearchResult {
   path: string;
@@ -8,10 +8,11 @@ export interface SearchResult {
   snippet?: string;
 }
 
-const MAX_SEARCH_LIMIT = 1000;
+const MAX_SEARCH_LIMIT = 100;
 
 function clampLimit(limit: number | undefined): number {
   const val = limit ?? 20;
+  if (!Number.isFinite(val)) return 20;
   return Math.min(Math.max(1, val), MAX_SEARCH_LIMIT);
 }
 
@@ -44,12 +45,11 @@ interface VectorRow {
 export async function fullTextSearch(
   sql: postgres.Sql,
   sessionId: number,
-  ltreePrefix: string,
   query: string,
   opts?: { path?: string; limit?: number }
 ): Promise<SearchResult[]> {
   const limit = clampLimit(opts?.limit);
-  const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
+  const scopeLtree = pathToLtree(opts?.path ?? "/", sessionId);
 
   const rows = await sql<FtsRow[]>`
     SELECT
@@ -78,12 +78,11 @@ export async function fullTextSearch(
 export async function semanticSearch(
   sql: postgres.Sql,
   sessionId: number,
-  ltreePrefix: string,
   embedding: number[],
   opts?: { path?: string; limit?: number }
 ): Promise<SearchResult[]> {
   const limit = clampLimit(opts?.limit);
-  const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
+  const scopeLtree = pathToLtree(opts?.path ?? "/", sessionId);
   validateEmbedding(embedding);
   const embeddingStr = `[${embedding.join(",")}]`;
 
@@ -111,7 +110,6 @@ export async function semanticSearch(
 export async function hybridSearch(
   sql: postgres.Sql,
   sessionId: number,
-  ltreePrefix: string,
   query: string,
   embedding: number[],
   opts?: { path?: string; textWeight?: number; vectorWeight?: number; limit?: number }
@@ -122,7 +120,7 @@ export async function hybridSearch(
   if (!Number.isFinite(textWeight) || !Number.isFinite(vectorWeight)) {
     throw new Error("Search weights must be finite numbers");
   }
-  const scopeLtree = buildScopeLtree(ltreePrefix, opts?.path);
+  const scopeLtree = pathToLtree(opts?.path ?? "/", sessionId);
   validateEmbedding(embedding);
   const embeddingStr = `[${embedding.join(",")}]`;
 
@@ -147,12 +145,4 @@ export async function hybridSearch(
     name: r.name,
     rank: parseFloat(r.rank),
   }));
-}
-
-function buildScopeLtree(ltreePrefix: string, path?: string): string {
-  if (!path || path === "/") return ltreePrefix;
-  const normalized = normalizePath(path);
-  const segments = normalized.split("/").filter(Boolean);
-  const encodedSegments = segments.map(encodeLabel);
-  return ltreePrefix + "." + encodedSegments.join(".");
 }

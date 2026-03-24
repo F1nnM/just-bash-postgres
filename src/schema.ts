@@ -1,10 +1,7 @@
 import type postgres from "postgres";
-import { readFileSync } from "fs";
-import { join } from "path";
+import migration from "../sql/001-setup.sql" with { type: "text" };
 
 export async function setupSchema(sql: postgres.Sql): Promise<void> {
-  const migrationPath = join(import.meta.dir, "..", "sql", "001-setup.sql");
-  const migration = readFileSync(migrationPath, "utf-8");
   await sql.unsafe(migration);
 }
 
