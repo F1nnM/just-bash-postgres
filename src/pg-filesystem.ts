@@ -576,7 +576,7 @@ export class PgFileSystem implements IFileSystem {
         const lt = pathToLtree(p, this.sessionId);
         await tx`
           DELETE FROM fs_nodes
-          WHERE session_id = ${this.sessionId} AND path <@ ${lt}::ltree
+          WHERE session_id = ${this.sessionId} AND path <@ ${lt}::text::ltree
         `;
       } else {
         await tx`
@@ -652,7 +652,7 @@ export class PgFileSystem implements IFileSystem {
           UPDATE fs_nodes
           SET path = (${newLtree}::ltree || subpath(path, nlevel(${oldLtree}::ltree)))
           WHERE session_id = ${this.sessionId}
-            AND path <@ ${oldLtree}::ltree
+            AND path <@ ${oldLtree}::text::ltree
         `;
 
         await tx`
@@ -661,8 +661,8 @@ export class PgFileSystem implements IFileSystem {
           FROM fs_nodes AS parent
           WHERE child.session_id = ${this.sessionId}
             AND parent.session_id = ${this.sessionId}
-            AND child.path <@ ${newLtree}::ltree
-            AND child.path != ${newLtree}::ltree
+            AND child.path <@ ${newLtree}::text::ltree
+            AND child.path != ${newLtree}::text::ltree
             AND parent.path = subltree(child.path, 0, nlevel(child.path) - 1)
         `;
       }

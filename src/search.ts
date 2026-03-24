@@ -60,7 +60,7 @@ export async function fullTextSearch(
         'MaxWords=35, MinWords=15, MaxFragments=1') AS snippet
     FROM fs_nodes
     WHERE session_id = ${sessionId}
-      AND path <@ ${scopeLtree}::ltree
+      AND path <@ ${scopeLtree}::text::ltree
       AND node_type = 'file'
       AND search_vector @@ websearch_to_tsquery('english', ${query})
     ORDER BY rank DESC
@@ -93,7 +93,7 @@ export async function semanticSearch(
       1 - (embedding <=> ${embeddingStr}::vector) AS rank
     FROM fs_nodes
     WHERE session_id = ${sessionId}
-      AND path <@ ${scopeLtree}::ltree
+      AND path <@ ${scopeLtree}::text::ltree
       AND node_type = 'file'
       AND embedding IS NOT NULL
     ORDER BY embedding <=> ${embeddingStr}::vector
@@ -132,7 +132,7 @@ export async function hybridSearch(
        ${vectorWeight} * (1 - (embedding <=> ${embeddingStr}::vector))) AS rank
     FROM fs_nodes
     WHERE session_id = ${sessionId}
-      AND path <@ ${scopeLtree}::ltree
+      AND path <@ ${scopeLtree}::text::ltree
       AND node_type = 'file'
       AND search_vector @@ websearch_to_tsquery('english', ${query})
       AND embedding IS NOT NULL
