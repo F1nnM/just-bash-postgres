@@ -1,6 +1,6 @@
 {
   "name": "just-bash-postgres",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "PostgreSQL filesystem provider for just-bash with ltree, FTS, vector search, and RLS",
   "main": "src/index.ts",
   "types": "src/index.ts",
