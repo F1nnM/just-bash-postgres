@@ -271,18 +271,6 @@ By default, tests connect to `postgres://postgres@localhost:5433/just_bash_postg
 bun run typecheck
 ```
 
-## Publishing
-
-Releases are published to npm automatically via GitHub Actions when you [create a release](https://github.com/F1nnM/just-bash-postgres/releases/new) on GitHub.
-
-To publish manually:
-
-```bash
-npm publish
-```
-
-> Requires `NPM_TOKEN` secret in the repository settings for automated publishing.
-
 ## License
 
 [MIT](LICENSE)
